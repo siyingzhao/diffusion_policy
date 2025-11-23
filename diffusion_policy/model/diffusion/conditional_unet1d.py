@@ -220,8 +220,11 @@ class ConditionalUnet1D(nn.Module):
             h.append(x)
             x = downsample(x)
 
+        # 保存 mid_modules 输出作为中间特征
+        mid_feature = None
         for mid_module in self.mid_modules:
             x = mid_module(x, global_feature)
+        mid_feature = x  # 保存中间特征，shape: (B, mid_dim, horizon)
 
         for idx, (resnet, resnet2, upsample) in enumerate(self.up_modules):
             x = torch.cat((x, h.pop()), dim=1)
@@ -238,5 +241,5 @@ class ConditionalUnet1D(nn.Module):
         x = self.final_conv(x)
 
         x = einops.rearrange(x, 'b t h -> b h t')
-        return x
+        return x, mid_feature
 

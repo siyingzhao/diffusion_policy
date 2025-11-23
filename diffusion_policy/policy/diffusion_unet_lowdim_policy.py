@@ -24,6 +24,12 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             obs_as_global_cond=False,
             pred_action_steps_only=False,
             oa_step_convention=False,
+            # ===== 新增参数 =====
+            use_alignment_loss=False,           # 是否启用对齐 loss
+            alignment_loss_weight=0.5,          # 对齐 loss 权重
+            projection_hidden_dims=[512, 256],        # MLP 隐藏层维度
+            alignment_loss_type='mse',          # 'mse' 或 'cosine'
+            # ====================
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -54,6 +60,22 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
+
+         # ===== 新增：初始化投影头 =====
+        self.use_alignment_loss = use_alignment_loss
+        self.alignment_loss_weight = alignment_loss_weight
+        self.alignment_loss_type = alignment_loss_type
+    
+        self.projection_head = None
+        if use_alignment_loss:
+            from diffusion_policy.model.common.projection_head import REPAProjectionHead
+            # mid_dim 是 UNet 最深层的通道数（down_dims 的最后一个）
+            mid_dim = model.mid_modules[0].out_channels
+            self.projection_head = REPAProjectionHead(
+                input_dim=mid_dim,
+                output_dim=action_dim,  # displacement 与 action 维度相同
+                hidden_dims=projection_hidden_dims
+            )
     
     # ========= inference  ============
     def conditional_sample(self, 
@@ -80,7 +102,8 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             trajectory[condition_mask] = condition_data[condition_mask]
 
             # 2. predict model output
-            model_output = model(trajectory, t, 
+             # ===== 修改这里：只取第一个返回值 =====
+            model_output, _ = model(trajectory, t, 
                 local_cond=local_cond, global_cond=global_cond)
 
             # 3. compute previous image: x_t -> x_t-1
@@ -94,6 +117,23 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         trajectory[condition_mask] = condition_data[condition_mask]        
 
         return trajectory
+    
+    def _compute_displacement_gt(self, action):
+        """
+        计算动作序列的位移 GT
+    
+        Args:
+            action: (B, T, Da) - 归一化后的动作序列
+        Returns:
+            displacement: (B, Da) - 从第一帧到最后一帧的累积位移
+        """
+        # 方案1: 直接计算首尾差
+        displacement = action[:, -1, :] - action[:, 0, :]
+    
+        # 方案2: 计算累积和（如果需要）
+        # displacement = action.sum(dim=1)  # (B, Da)
+    
+        return displacement
 
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -234,7 +274,7 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         noisy_trajectory[condition_mask] = trajectory[condition_mask]
         
         # Predict the noise residual
-        pred = self.model(noisy_trajectory, timesteps, 
+        pred, mid_feature = self.model(noisy_trajectory, timesteps, 
             local_cond=local_cond, global_cond=global_cond)
 
         pred_type = self.noise_scheduler.config.prediction_type 
@@ -245,8 +285,40 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         else:
             raise ValueError(f"Unsupported prediction type {pred_type}")
 
-        loss = F.mse_loss(pred, target, reduction='none')
-        loss = loss * loss_mask.type(loss.dtype)
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
-        loss = loss.mean()
-        return loss
+        # ===== 原有的 diffusion loss =====
+        diffusion_loss = F.mse_loss(pred, target, reduction='none')
+        diffusion_loss = diffusion_loss * loss_mask.type(diffusion_loss.dtype)
+        diffusion_loss = reduce(diffusion_loss, 'b ... -> b (...)', 'mean')
+        diffusion_loss = diffusion_loss.mean()
+
+        # ===== 新增：计算对齐 loss =====
+        total_loss = diffusion_loss
+    
+        if self.use_alignment_loss and self.projection_head is not None:
+            # 1. 计算 displacement GT
+            # action shape: (B, T, Da)
+            displacement_gt = self._compute_displacement_gt(action)
+        
+            # 2. MLP 投影
+            projected_displacement = self.projection_head(mid_feature)
+        
+            # 3. 计算对齐 loss (REPA-style: 归一化 + 负余弦相似度)
+            if self.alignment_loss_type == 'mse':
+                alignment_loss = F.mse_loss(
+                    projected_displacement, 
+                    displacement_gt
+                )
+            elif self.alignment_loss_type == 'cosine':
+                # REPA 原始实现: 先归一化，再计算负内积
+                projected_norm = F.normalize(projected_displacement, dim=-1)
+                gt_norm = F.normalize(displacement_gt, dim=-1)
+                # 负余弦相似度: -(z · z_tilde)
+                alignment_loss = -(projected_norm * gt_norm).sum(dim=-1).mean()
+            else:
+                raise ValueError(f"Unknown alignment_loss_type: {self.alignment_loss_type}")
+        
+            # 4. 加权组合
+            total_loss = diffusion_loss + self.alignment_loss_weight * alignment_loss
+        # ===============================
+    
+        return total_loss
