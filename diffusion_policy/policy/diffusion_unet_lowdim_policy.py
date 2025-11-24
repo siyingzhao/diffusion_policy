@@ -27,7 +27,7 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             # ===== 新增参数 =====
             use_alignment_loss=False,           # 是否启用对齐 loss
             alignment_loss_weight=0.5,          # 对齐 loss 权重
-            projection_hidden_dims=[512, 256],        # MLP 隐藏层维度
+            projection_hidden_dims=[256, 512],        # MLP 隐藏层维度
             alignment_loss_type='mse',          # 'mse' 或 'cosine'
             # ====================
             # parameters passed to step
@@ -72,8 +72,8 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             # mid_dim 是 UNet 最深层的通道数（down_dims 的最后一个）
             mid_dim = model.mid_modules[0].out_channels
             self.projection_head = REPAProjectionHead(
-                input_dim=mid_dim,
-                output_dim=action_dim,  # displacement 与 action 维度相同
+                input_dim=action_dim,
+                output_dim=mid_dim,  # displacement 与 action 维度相同
                 hidden_dims=projection_hidden_dims
             )
     
@@ -300,24 +300,28 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             displacement_gt = self._compute_displacement_gt(action)
         
             # 2. MLP 投影
-            projected_displacement = self.projection_head(mid_feature)
+            gt_embedding = self.projection_head(displacement_gt) # (B, Mid_Dim)
+
+            # 3. 对 UNet 中间特征进行时间池化
+            mid_feature_pooled = mid_feature.mean(dim=-1) # (B, Mid_Dim)
         
-            # 3. 计算对齐 loss (REPA-style: 归一化 + 负余弦相似度)
+            # 4. 计算对齐 loss (REPA-style: 归一化 + 负余弦相似度)
             if self.alignment_loss_type == 'mse':
                 alignment_loss = F.mse_loss(
-                    projected_displacement, 
-                    displacement_gt
+                    gt_embedding, 
+                    mid_feature_pooled
                 )
             elif self.alignment_loss_type == 'cosine':
-                # REPA 原始实现: 先归一化，再计算负内积
-                projected_norm = F.normalize(projected_displacement, dim=-1)
-                gt_norm = F.normalize(displacement_gt, dim=-1)
-                # 负余弦相似度: -(z · z_tilde)
-                alignment_loss = -(projected_norm * gt_norm).sum(dim=-1).mean()
+                alignment_loss = 1.0 - F.cosine_similarity(
+                    gt_embedding, 
+                    mid_feature_pooled, 
+                    dim=-1, 
+                    eps=1e-6
+                ).mean()
             else:
                 raise ValueError(f"Unknown alignment_loss_type: {self.alignment_loss_type}")
         
-            # 4. 加权组合
+            # 5. 加权组合
             total_loss = diffusion_loss + self.alignment_loss_weight * alignment_loss
         # ===============================
     
