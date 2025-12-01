@@ -4,19 +4,19 @@ import torch.nn as nn
 class REPAProjectionHead(nn.Module):
     """
     REPA-style projection head for alignment loss.
-    Projects mid-level features to displacement space.
+    Projects displacement to latent space (reverse direction).
     """
     def __init__(
         self, 
-        input_dim: int,          # UNet mid_feature 的通道数 (e.g., 1024)
-        output_dim: int,         # displacement 维度 (e.g., action_dim)
-        hidden_dims: list = [512, 256], # MLP 隐藏层维度
+        input_dim: int,          # displacement 维度 (action_dim)
+        output_dim: int,         # UNet mid_feature 的通道数 (e.g., 1024)
+        hidden_dims: list = [256, 512], # MLP 隐藏层维度
         activation: str = 'relu'
     ):
         super().__init__()
         
         if hidden_dims is None:
-            hidden_dims = [512, 256]  # 默认两层隐藏层
+            hidden_dims = [256, 512]  # 默认两层隐藏层
         
         layers = []
         prev_dim = input_dim
@@ -35,17 +35,14 @@ class REPAProjectionHead(nn.Module):
         
         self.mlp = nn.Sequential(*layers)
     
-    def forward(self, mid_feature):
+    def forward(self, displacement):
         """
         Args:
-            mid_feature: (B, C, T) - UNet 中间特征
+            displacement: (B, action_dim) - 动作位移向量
         Returns:
-            projected: (B, output_dim) - 投影到 displacement 空间
+            projected_latent: (B, output_dim) - 投影到 latent space
         """
-        # Global pooling: (B, C, T) -> (B, C)
-        pooled = mid_feature.mean(dim=-1)  # 时间维度平均池化
+        # MLP projection: (B, action_dim) -> (B, latent_dim)
+        projected_latent = self.mlp(displacement)
         
-        # MLP projection: (B, C) -> (B, output_dim)
-        projected = self.mlp(pooled)
-        
-        return projected
+        return projected_latent

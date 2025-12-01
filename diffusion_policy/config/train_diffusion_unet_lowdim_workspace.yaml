@@ -63,7 +63,7 @@ policy:
   use_alignment_loss: true
   alignment_loss_weight: 0.5     # 可调节权重
   alignment_loss_type: 'mse'     # 'mse' 或 'cosine'
-  projection_hidden_dims: [512, 256]
+  projection_hidden_dims: [256, 512]
   # ====================
 
 ema:

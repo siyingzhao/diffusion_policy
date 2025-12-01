@@ -72,8 +72,8 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             # mid_dim 是 UNet 最深层的通道数（down_dims 的最后一个）
             mid_dim = model.mid_modules[0].out_channels
             self.projection_head = REPAProjectionHead(
-                input_dim=mid_dim,
-                output_dim=action_dim,  # displacement 与 action 维度相同
+                input_dim=action_dim,  # 反向映射: displacement -> latent
+                output_dim=mid_dim,    # 输出到 latent space
                 hidden_dims=projection_hidden_dims
             )
     
@@ -301,37 +301,41 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             # 1. 计算 displacement GT
             displacement_gt = self._compute_displacement_gt(action)
             
-            # 2. MLP 投影 - 使用 detach() 阻止梯度回传到 UNet
-            # 注意: 只 detach 输入,让 MLP 自己的梯度正常计算
-            projected_displacement = self.projection_head(mid_feature.detach())
+            # 2. 对 mid_feature 进行时间维度池化 (B, C, T) -> (B, C)
+            mid_feature_pooled = mid_feature.mean(dim=-1)
             
-            # 3. 计算投影 loss（用于训练 MLP）
+            # 3. MLP 反向投影: displacement → latent space
+            # 注意: displacement_gt 不需要梯度传到 action,所以 detach
+            projected_latent = self.projection_head(displacement_gt.detach())  # (B, mid_dim)
+            
+            # 4. 计算对齐 loss (在 latent space 中比较)
+            # mid_feature_pooled.detach() 阻止梯度回传到 UNet
             if self.alignment_loss_type == 'mse':
                 alignment_loss = F.mse_loss(
-                    projected_displacement, 
-                    displacement_gt
+                    projected_latent, 
+                    mid_feature_pooled.detach()  # detach 阻止影响 UNet
                 )
             elif self.alignment_loss_type == 'cosine':
-                projected_norm = F.normalize(projected_displacement, dim=-1)
-                gt_norm = F.normalize(displacement_gt, dim=-1)
-                alignment_loss = -(projected_norm * gt_norm).sum(dim=-1).mean()
+                projected_norm = F.normalize(projected_latent, dim=-1)
+                feature_norm = F.normalize(mid_feature_pooled.detach(), dim=-1)
+                alignment_loss = -(projected_norm * feature_norm).sum(dim=-1).mean()
             else:
                 raise ValueError(f"Unknown alignment_loss_type: {self.alignment_loss_type}")
             
-            # 4. 计算投影误差指标（RMSE，与 GT 同量纲）
+            # 5. 计算投影误差指标（在 latent space 的距离）
             with torch.no_grad():
-                projection_mse = F.mse_loss(projected_displacement, displacement_gt)
-                projection_rmse = torch.sqrt(projection_mse)  # 开根号
-                # 计算真实 displacement 的 L2 范数作为参考
-                gt_norm_l2 = torch.norm(displacement_gt, dim=-1).mean()
+                projection_mse = F.mse_loss(projected_latent, mid_feature_pooled)
+                projection_rmse = torch.sqrt(projection_mse)
+                # 计算 mid_feature 的 L2 范数作为参考
+                feature_norm_l2 = torch.norm(mid_feature_pooled, dim=-1).mean()
             
-            # 5. 记录到字典
+            # 6. 记录到字典
             loss_dict['alignment_loss'] = alignment_loss.item()
             loss_dict['projection_rmse'] = projection_rmse.item()
-            loss_dict['displacement_gt_norm'] = gt_norm_l2.item()
-            loss_dict['projection_error_ratio'] = (projection_rmse / (gt_norm_l2 + 1e-8)).item()
+            loss_dict['latent_feature_norm'] = feature_norm_l2.item()
+            loss_dict['projection_error_ratio'] = (projection_rmse / (feature_norm_l2 + 1e-8)).item()
             
-            # 6. 只把 alignment_loss 加到总 loss（MLP 独立训练）
+            # 7. 只把 alignment_loss 加到总 loss（MLP 独立训练）
             loss_dict['loss'] = diffusion_loss + self.alignment_loss_weight * alignment_loss
         # ===============================
     
