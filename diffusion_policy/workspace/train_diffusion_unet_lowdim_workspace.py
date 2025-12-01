@@ -165,8 +165,17 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                             train_sampling_batch = batch
 
                         # compute loss
-                        raw_loss = self.model.compute_loss(batch)
-                        loss = raw_loss / cfg.training.gradient_accumulate_every
+                        loss_output = self.model.compute_loss(batch)
+                        
+                        # 处理返回值：可能是字典或标量
+                        if isinstance(loss_output, dict):
+                            raw_loss = loss_output['loss']
+                            loss = raw_loss / cfg.training.gradient_accumulate_every
+                        else:
+                            raw_loss = loss_output
+                            loss = raw_loss / cfg.training.gradient_accumulate_every
+                            loss_output = {'loss': raw_loss}
+                        
                         loss.backward()
 
                         # step optimizer
@@ -180,7 +189,7 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                             ema.step(self.model)
 
                         # logging
-                        raw_loss_cpu = raw_loss.item()
+                        raw_loss_cpu = raw_loss.item() if torch.is_tensor(raw_loss) else raw_loss
                         tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
                         train_losses.append(raw_loss_cpu)
                         step_log = {
@@ -189,6 +198,14 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                             'epoch': self.epoch,
                             'lr': lr_scheduler.get_last_lr()[0]
                         }
+                        
+                        # 添加额外的 loss 指标
+                        if isinstance(loss_output, dict):
+                            for key, value in loss_output.items():
+                                if key != 'loss':  # loss 已经记录为 train_loss
+                                    metric_key = f'train_{key}'
+                                    metric_value = value.item() if torch.is_tensor(value) else value
+                                    step_log[metric_key] = metric_value
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:
@@ -222,17 +239,38 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                 if (self.epoch % cfg.training.val_every) == 0:
                     with torch.no_grad():
                         val_losses = list()
+                        val_metrics = {}  # 用于累积验证指标
                         with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = self.model.compute_loss(batch)
-                                val_losses.append(loss)
+                                loss_output = self.model.compute_loss(batch)
+                                
+                                # 处理返回值
+                                if isinstance(loss_output, dict):
+                                    loss = loss_output['loss']
+                                    # 累积其他指标
+                                    for key, value in loss_output.items():
+                                        if key not in val_metrics:
+                                            val_metrics[key] = []
+                                        metric_value = value.item() if torch.is_tensor(value) else value
+                                        val_metrics[key].append(metric_value)
+                                else:
+                                    loss = loss_output
+                                
+                                val_losses.append(loss.item() if torch.is_tensor(loss) else loss)
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
                                     break
                         if len(val_losses) > 0:
-                            val_loss = torch.mean(torch.tensor(val_losses)).item()
+                            val_loss = np.mean(val_losses)
+                            # log epoch average validation loss
+                            step_log['val_loss'] = val_loss
+                            
+                            # 添加其他验证指标的平均值
+                            for key, values in val_metrics.items():
+                                if key != 'loss' and len(values) > 0:
+                                    step_log[f'val_{key}'] = np.mean(values)
                             # log epoch average validation loss
                             step_log['val_loss'] = val_loss
 

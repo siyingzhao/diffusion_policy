@@ -27,7 +27,7 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             # ===== 新增参数 =====
             use_alignment_loss=False,           # 是否启用对齐 loss
             alignment_loss_weight=0.5,          # 对齐 loss 权重
-            projection_hidden_dims=[256, 512],        # MLP 隐藏层维度
+            projection_hidden_dims=[512, 256],        # MLP 隐藏层维度
             alignment_loss_type='mse',          # 'mse' 或 'cosine'
             # ====================
             # parameters passed to step
@@ -72,8 +72,8 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             # mid_dim 是 UNet 最深层的通道数（down_dims 的最后一个）
             mid_dim = model.mid_modules[0].out_channels
             self.projection_head = REPAProjectionHead(
-                input_dim=action_dim,
-                output_dim=mid_dim,  # displacement 与 action 维度相同
+                input_dim=mid_dim,
+                output_dim=action_dim,  # displacement 与 action 维度相同
                 hidden_dims=projection_hidden_dims
             )
     
@@ -291,38 +291,48 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         diffusion_loss = reduce(diffusion_loss, 'b ... -> b (...)', 'mean')
         diffusion_loss = diffusion_loss.mean()
 
-        # ===== 新增：计算对齐 loss =====
-        total_loss = diffusion_loss
-    
+        # ===== 新增：独立的投影监控（不参与主训练） =====
+        loss_dict = {
+            'loss': diffusion_loss,
+            'diffusion_loss': diffusion_loss.item(),
+        }
+        
         if self.use_alignment_loss and self.projection_head is not None:
             # 1. 计算 displacement GT
-            # action shape: (B, T, Da)
             displacement_gt = self._compute_displacement_gt(action)
-        
-            # 2. MLP 投影
-            gt_embedding = self.projection_head(displacement_gt) # (B, Mid_Dim)
-
-            # 3. 对 UNet 中间特征进行时间池化
-            mid_feature_pooled = mid_feature.mean(dim=-1) # (B, Mid_Dim)
-        
-            # 4. 计算对齐 loss (REPA-style: 归一化 + 负余弦相似度)
+            
+            # 2. MLP 投影 - 使用 detach() 阻止梯度回传到 UNet
+            # 注意: 只 detach 输入,让 MLP 自己的梯度正常计算
+            projected_displacement = self.projection_head(mid_feature.detach())
+            
+            # 3. 计算投影 loss（用于训练 MLP）
             if self.alignment_loss_type == 'mse':
                 alignment_loss = F.mse_loss(
-                    gt_embedding, 
-                    mid_feature_pooled
+                    projected_displacement, 
+                    displacement_gt
                 )
             elif self.alignment_loss_type == 'cosine':
-                alignment_loss = 1.0 - F.cosine_similarity(
-                    gt_embedding, 
-                    mid_feature_pooled, 
-                    dim=-1, 
-                    eps=1e-6
-                ).mean()
+                projected_norm = F.normalize(projected_displacement, dim=-1)
+                gt_norm = F.normalize(displacement_gt, dim=-1)
+                alignment_loss = -(projected_norm * gt_norm).sum(dim=-1).mean()
             else:
                 raise ValueError(f"Unknown alignment_loss_type: {self.alignment_loss_type}")
-        
-            # 5. 加权组合
-            total_loss = diffusion_loss + self.alignment_loss_weight * alignment_loss
+            
+            # 4. 计算投影误差指标（RMSE，与 GT 同量纲）
+            with torch.no_grad():
+                projection_mse = F.mse_loss(projected_displacement, displacement_gt)
+                projection_rmse = torch.sqrt(projection_mse)  # 开根号
+                # 计算真实 displacement 的 L2 范数作为参考
+                gt_norm_l2 = torch.norm(displacement_gt, dim=-1).mean()
+            
+            # 5. 记录到字典
+            loss_dict['alignment_loss'] = alignment_loss.item()
+            loss_dict['projection_rmse'] = projection_rmse.item()
+            loss_dict['displacement_gt_norm'] = gt_norm_l2.item()
+            loss_dict['projection_error_ratio'] = (projection_rmse / (gt_norm_l2 + 1e-8)).item()
+            
+            # 6. 只把 alignment_loss 加到总 loss（MLP 独立训练）
+            loss_dict['loss'] = diffusion_loss + self.alignment_loss_weight * alignment_loss
         # ===============================
     
-        return total_loss
+        return loss_dict
