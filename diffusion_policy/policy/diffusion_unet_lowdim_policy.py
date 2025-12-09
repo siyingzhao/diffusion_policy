@@ -24,6 +24,7 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             obs_as_global_cond=False,
             pred_action_steps_only=False,
             oa_step_convention=False,
+            use_displacement_token=True,  # 新增：是否使用位移token
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -49,6 +50,7 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         self.obs_as_global_cond = obs_as_global_cond
         self.pred_action_steps_only = pred_action_steps_only
         self.oa_step_convention = oa_step_convention
+        self.use_displacement_token = use_displacement_token  # 新增
         self.kwargs = kwargs
 
         if num_inference_steps is None:
@@ -110,6 +112,9 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         assert Do == self.obs_dim
         T = self.horizon
         Da = self.action_dim
+        
+        # 如果使用位移token，序列长度增加1
+        T_extended = T + 1 if self.use_displacement_token else T
 
         # build input
         device = self.device
@@ -121,22 +126,23 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         if self.obs_as_local_cond:
             # condition through local feature
             # all zero except first To timesteps
-            local_cond = torch.zeros(size=(B,T,Do), device=device, dtype=dtype)
+            local_cond = torch.zeros(size=(B,T_extended,Do), device=device, dtype=dtype)
             local_cond[:,:To] = nobs[:,:To]
-            shape = (B, T, Da)
+            shape = (B, T_extended, Da)
             cond_data = torch.zeros(size=shape, device=device, dtype=dtype)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
         elif self.obs_as_global_cond:
             # condition throught global feature
             global_cond = nobs[:,:To].reshape(nobs.shape[0], -1)
-            shape = (B, T, Da)
+            shape = (B, T_extended, Da)
             if self.pred_action_steps_only:
-                shape = (B, self.n_action_steps, Da)
+                n_action_extended = self.n_action_steps + 1 if self.use_displacement_token else self.n_action_steps
+                shape = (B, n_action_extended, Da)
             cond_data = torch.zeros(size=shape, device=device, dtype=dtype)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
         else:
             # condition through impainting
-            shape = (B, T, Da+Do)
+            shape = (B, T_extended, Da+Do)
             cond_data = torch.zeros(size=shape, device=device, dtype=dtype)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
             cond_data[:,:To,Da:] = nobs[:,:To]
@@ -150,8 +156,17 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             global_cond=global_cond,
             **self.kwargs)
         
+        # 如果使用位移token，分离出位移预测和动作预测
+        if self.use_displacement_token:
+            # 最后一个token是位移预测
+            displacement_pred = nsample[:, -1:, :Da]  # (B, 1, Da)
+            nsample_actions = nsample[:, :-1, :]  # (B, T, Da) 或 (B, T, Da+Do)
+        else:
+            displacement_pred = None
+            nsample_actions = nsample
+        
         # unnormalize prediction
-        naction_pred = nsample[...,:Da]
+        naction_pred = nsample_actions[...,:Da]
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
 
         # get action
@@ -168,8 +183,15 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             'action': action,
             'action_pred': action_pred
         }
+        
+        # 添加位移预测到结果
+        if self.use_displacement_token and displacement_pred is not None:
+            # 对位移也进行反归一化（使用action的normalizer，因为位移和action同维度）
+            displacement_pred_unnorm = self.normalizer['action'].unnormalize(displacement_pred)
+            result['displacement_pred'] = displacement_pred_unnorm.squeeze(1)  # (B, Da)
+        
         if not (self.obs_as_local_cond or self.obs_as_global_cond):
-            nobs_pred = nsample[...,Da:]
+            nobs_pred = nsample_actions[...,Da:]
             obs_pred = self.normalizer['obs'].unnormalize(nobs_pred)
             action_obs_pred = obs_pred[:,start:end]
             result['action_obs_pred'] = action_obs_pred
@@ -207,6 +229,41 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
                 trajectory = action[:,start:end]
         else:
             trajectory = torch.cat([action, obs], dim=-1)
+
+        # ====== 添加位移token ======
+        if self.use_displacement_token:
+            # 计算位移: 最后一个action - 第一个action
+            # trajectory shape: (B, T, Da) 或 (B, T, Da+Do)
+            Da = self.action_dim
+            
+            # 提取action部分计算位移
+            action_part = trajectory[..., :Da]  # (B, T, Da)
+            displacement = action_part[:, -1, :] - action_part[:, 0, :]  # (B, Da)
+            
+            # 构造位移token，维度与trajectory最后一维相同
+            if trajectory.shape[-1] == Da:
+                # 只有action的情况
+                displacement_token = displacement.unsqueeze(1)  # (B, 1, Da)
+            else:
+                # action + obs的情况，obs部分填0
+                obs_dim = trajectory.shape[-1] - Da
+                displacement_token = torch.cat([
+                    displacement.unsqueeze(1),  # (B, 1, Da)
+                    torch.zeros(trajectory.shape[0], 1, obs_dim, 
+                               device=trajectory.device, dtype=trajectory.dtype)
+                ], dim=-1)  # (B, 1, Da+obs_dim)
+            
+            # 拼接位移token到序列末尾
+            trajectory = torch.cat([trajectory, displacement_token], dim=1)  # (B, T+1, D)
+            
+            # 同样扩展local_cond
+            if local_cond is not None:
+                # 位移token对应的local_cond设为0
+                local_cond_pad = torch.zeros(
+                    local_cond.shape[0], 1, local_cond.shape[2],
+                    device=local_cond.device, dtype=local_cond.dtype
+                )
+                local_cond = torch.cat([local_cond, local_cond_pad], dim=1)
 
         # generate impainting mask
         if self.pred_action_steps_only:
