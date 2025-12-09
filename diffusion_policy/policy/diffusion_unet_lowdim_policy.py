@@ -299,8 +299,9 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             # action shape: (B, T, Da)
             displacement_gt = self._compute_displacement_gt(action)
         
-            # 2. MLP 投影
-            projected_displacement = self.projection_head(mid_feature)
+            # 2. MLP 投影（使用 detach() 阻断梯度回传到 UNet）
+            # 这样 alignment_loss 只更新 projection_head，不影响 UNet
+            projected_displacement = self.projection_head(mid_feature.detach())
         
             # 3. 计算对齐 loss (REPA-style: 归一化 + 负余弦相似度)
             if self.alignment_loss_type == 'mse':
@@ -319,6 +320,25 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         
             # 4. 加权组合
             total_loss = diffusion_loss + self.alignment_loss_weight * alignment_loss
+            
+            # 5. 计算相对误差: sqrt(alignment_loss) / mean(|displacement_gt|)
+            rmse = torch.sqrt(alignment_loss)
+            gt_magnitude = torch.norm(displacement_gt, dim=-1).mean()
+            alignment_relative_error = rmse / (gt_magnitude + 1e-8)
+            
+            # 返回字典，包含各项 loss
+            return {
+                'total_loss': total_loss,
+                'diffusion_loss': diffusion_loss.detach(),
+                'alignment_loss': alignment_loss.detach(),
+                'alignment_relative_error': alignment_relative_error.detach()
+            }
         # ===============================
     
-        return total_loss
+        # 如果不使用 alignment loss，返回兼容格式
+        return {
+            'total_loss': total_loss,
+            'diffusion_loss': diffusion_loss.detach(),
+            'alignment_loss': torch.tensor(0.0, device=diffusion_loss.device),
+            'alignment_relative_error': torch.tensor(0.0, device=diffusion_loss.device)
+        }

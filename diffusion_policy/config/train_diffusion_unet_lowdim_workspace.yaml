@@ -61,7 +61,7 @@ policy:
 
   # ===== 新增配置 =====
   use_alignment_loss: true
-  alignment_loss_weight: 0.1     # 可调节权重
+  alignment_loss_weight: 0.5     # 可调节权重
   alignment_loss_type: 'mse'     # 或 'cosine'
   projection_hidden_dims: [512, 256]
   # ====================
@@ -103,7 +103,7 @@ training:
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 800
+  num_epochs: 4000
   gradient_accumulate_every: 1
   use_ema: True
   # training loop control

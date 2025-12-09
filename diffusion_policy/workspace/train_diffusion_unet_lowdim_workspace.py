@@ -165,9 +165,15 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                             train_sampling_batch = batch
 
                         # compute loss
-                        raw_loss = self.model.compute_loss(batch)
+                        loss_dict = self.model.compute_loss(batch)
+                        raw_loss = loss_dict['total_loss']
                         loss = raw_loss / cfg.training.gradient_accumulate_every
                         loss.backward()
+                        
+                        # 提取各项 loss 用于日志
+                        diffusion_loss_cpu = loss_dict['diffusion_loss'].item()
+                        alignment_loss_cpu = loss_dict['alignment_loss'].item()
+                        alignment_relative_error_cpu = loss_dict['alignment_relative_error'].item()
 
                         # step optimizer
                         if self.global_step % cfg.training.gradient_accumulate_every == 0:
@@ -185,6 +191,9 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                         train_losses.append(raw_loss_cpu)
                         step_log = {
                             'train_loss': raw_loss_cpu,
+                            'diffusion_loss': diffusion_loss_cpu,
+                            'alignment_loss': alignment_loss_cpu,
+                            'alignment_relative_error': alignment_relative_error_cpu,
                             'global_step': self.global_step,
                             'epoch': self.epoch,
                             'lr': lr_scheduler.get_last_lr()[0]
@@ -222,19 +231,28 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                 if (self.epoch % cfg.training.val_every) == 0:
                     with torch.no_grad():
                         val_losses = list()
+                        val_diffusion_losses = list()
+                        val_alignment_losses = list()
+                        val_alignment_relative_errors = list()
                         with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = self.model.compute_loss(batch)
-                                val_losses.append(loss)
+                                loss_dict = self.model.compute_loss(batch)
+                                val_losses.append(loss_dict['total_loss'].item())
+                                val_diffusion_losses.append(loss_dict['diffusion_loss'].item())
+                                val_alignment_losses.append(loss_dict['alignment_loss'].item())
+                                val_alignment_relative_errors.append(loss_dict['alignment_relative_error'].item())
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
                                     break
                         if len(val_losses) > 0:
-                            val_loss = torch.mean(torch.tensor(val_losses)).item()
+                            val_loss = np.mean(val_losses)
                             # log epoch average validation loss
                             step_log['val_loss'] = val_loss
+                            step_log['val_diffusion_loss'] = np.mean(val_diffusion_losses)
+                            step_log['val_alignment_loss'] = np.mean(val_alignment_losses)
+                            step_log['val_alignment_relative_error'] = np.mean(val_alignment_relative_errors)
 
                 # run diffusion sampling on a training batch
                 if (self.epoch % cfg.training.sample_every) == 0:
