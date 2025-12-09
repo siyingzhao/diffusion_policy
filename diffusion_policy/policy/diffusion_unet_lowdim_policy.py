@@ -25,6 +25,7 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             pred_action_steps_only=False,
             oa_step_convention=False,
             use_displacement_token=True,  # 新增：是否使用位移token
+            n_downsample_layers=3,  # UNet下采样层数，用于计算padding
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -51,11 +52,31 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         self.pred_action_steps_only = pred_action_steps_only
         self.oa_step_convention = oa_step_convention
         self.use_displacement_token = use_displacement_token  # 新增
+        self.n_downsample_layers = n_downsample_layers  # 新增
         self.kwargs = kwargs
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
+    
+    def _pad_to_multiple(self, x, multiple):
+        """将序列长度padding到multiple的整数倍"""
+        T = x.shape[1]
+        remainder = T % multiple
+        if remainder == 0:
+            return x, 0
+        pad_len = multiple - remainder
+        # 在时间维度末尾padding零
+        padding = torch.zeros(x.shape[0], pad_len, x.shape[2], 
+                             device=x.device, dtype=x.dtype)
+        x_padded = torch.cat([x, padding], dim=1)
+        return x_padded, pad_len
+    
+    def _unpad(self, x, pad_len):
+        """移除padding"""
+        if pad_len == 0:
+            return x
+        return x[:, :-pad_len, :]
     
     # ========= inference  ============
     def conditional_sample(self, 
@@ -67,11 +88,25 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             ):
         model = self.model
         scheduler = self.noise_scheduler
+        
+        # 计算需要padding到的倍数 (2^n_downsample_layers)
+        multiple = 2 ** self.n_downsample_layers
+        original_len = condition_data.shape[1]
+        
+        # Padding condition_data 和 condition_mask
+        condition_data_padded, pad_len = self._pad_to_multiple(condition_data, multiple)
+        condition_mask_padded, _ = self._pad_to_multiple(condition_mask.float(), multiple)
+        condition_mask_padded = condition_mask_padded.bool()
+        
+        # Padding local_cond (如果存在)
+        local_cond_padded = None
+        if local_cond is not None:
+            local_cond_padded, _ = self._pad_to_multiple(local_cond, multiple)
 
         trajectory = torch.randn(
-            size=condition_data.shape, 
-            dtype=condition_data.dtype,
-            device=condition_data.device,
+            size=condition_data_padded.shape, 
+            dtype=condition_data_padded.dtype,
+            device=condition_data_padded.device,
             generator=generator)
     
         # set step values
@@ -79,11 +114,11 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
 
         for t in scheduler.timesteps:
             # 1. apply conditioning
-            trajectory[condition_mask] = condition_data[condition_mask]
+            trajectory[condition_mask_padded] = condition_data_padded[condition_mask_padded]
 
             # 2. predict model output
             model_output = model(trajectory, t, 
-                local_cond=local_cond, global_cond=global_cond)
+                local_cond=local_cond_padded, global_cond=global_cond)
 
             # 3. compute previous image: x_t -> x_t-1
             trajectory = scheduler.step(
@@ -93,7 +128,10 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
                 ).prev_sample
         
         # finally make sure conditioning is enforced
-        trajectory[condition_mask] = condition_data[condition_mask]        
+        trajectory[condition_mask_padded] = condition_data_padded[condition_mask_padded]
+        
+        # 移除padding，恢复原始长度
+        trajectory = self._unpad(trajectory, pad_len)
 
         return trajectory
 
@@ -271,34 +309,53 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         else:
             condition_mask = self.mask_generator(trajectory.shape)
 
+        # ====== Padding for UNet compatibility ======
+        multiple = 2 ** self.n_downsample_layers
+        original_len = trajectory.shape[1]
+        
+        # Padding trajectory
+        trajectory_padded, pad_len = self._pad_to_multiple(trajectory, multiple)
+        
+        # Padding condition_mask
+        condition_mask_padded, _ = self._pad_to_multiple(condition_mask.float(), multiple)
+        condition_mask_padded = condition_mask_padded.bool()
+        
+        # Padding local_cond (如果存在)
+        local_cond_padded = None
+        if local_cond is not None:
+            local_cond_padded, _ = self._pad_to_multiple(local_cond, multiple)
+
         # Sample noise that we'll add to the images
-        noise = torch.randn(trajectory.shape, device=trajectory.device)
-        bsz = trajectory.shape[0]
+        noise = torch.randn(trajectory_padded.shape, device=trajectory_padded.device)
+        bsz = trajectory_padded.shape[0]
         # Sample a random timestep for each image
         timesteps = torch.randint(
             0, self.noise_scheduler.config.num_train_timesteps, 
-            (bsz,), device=trajectory.device
+            (bsz,), device=trajectory_padded.device
         ).long()
         # Add noise to the clean images according to the noise magnitude at each timestep
         # (this is the forward diffusion process)
         noisy_trajectory = self.noise_scheduler.add_noise(
-            trajectory, noise, timesteps)
+            trajectory_padded, noise, timesteps)
         
-        # compute loss mask
-        loss_mask = ~condition_mask
+        # compute loss mask (只对原始长度部分计算loss，padding部分不计入)
+        loss_mask = ~condition_mask_padded
+        # 将padding部分的loss_mask设为False，不计入loss
+        if pad_len > 0:
+            loss_mask[:, -pad_len:, :] = False
 
         # apply conditioning
-        noisy_trajectory[condition_mask] = trajectory[condition_mask]
+        noisy_trajectory[condition_mask_padded] = trajectory_padded[condition_mask_padded]
         
         # Predict the noise residual
         pred = self.model(noisy_trajectory, timesteps, 
-            local_cond=local_cond, global_cond=global_cond)
+            local_cond=local_cond_padded, global_cond=global_cond)
 
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':
             target = noise
         elif pred_type == 'sample':
-            target = trajectory
+            target = trajectory_padded
         else:
             raise ValueError(f"Unsupported prediction type {pred_type}")
 
