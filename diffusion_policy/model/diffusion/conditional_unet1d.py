@@ -75,7 +75,13 @@ class ConditionalUnet1D(nn.Module):
         down_dims=[256,512,1024],
         kernel_size=3,
         n_groups=8,
-        cond_predict_scale=False
+        cond_predict_scale=False,
+        # ===== 新增：Cross Attention 参数 =====
+        use_cross_attention=False,
+        cross_attention_dim=None,  # displacement 条件的维度
+        cross_attention_heads=8,
+        cross_attention_head_dim=64,
+        # =====================================
         ):
         super().__init__()
         all_dims = [input_dim] + list(down_dims)
@@ -124,6 +130,19 @@ class ConditionalUnet1D(nn.Module):
                 cond_predict_scale=cond_predict_scale
             ),
         ])
+        
+        # ===== 新增：Cross Attention 模块 =====
+        self.use_cross_attention = use_cross_attention
+        self.mid_cross_attention = None
+        if use_cross_attention and cross_attention_dim is not None:
+            from diffusion_policy.model.diffusion.cross_attention import CrossAttentionBlock1D
+            self.mid_cross_attention = CrossAttentionBlock1D(
+                query_dim=mid_dim,
+                cond_dim=cross_attention_dim,
+                num_heads=cross_attention_heads,
+                head_dim=cross_attention_head_dim,
+            )
+        # ========================================
 
         down_modules = nn.ModuleList([])
         for ind, (dim_in, dim_out) in enumerate(in_out):
@@ -173,12 +192,15 @@ class ConditionalUnet1D(nn.Module):
     def forward(self, 
             sample: torch.Tensor, 
             timestep: Union[torch.Tensor, float, int], 
-            local_cond=None, global_cond=None, **kwargs):
+            local_cond=None, global_cond=None, 
+            cross_attention_cond=None,  # 新增：Cross Attention 条件（如 displacement）
+            **kwargs):
         """
         x: (B,T,input_dim)
         timestep: (B,) or int, diffusion step
         local_cond: (B,T,local_cond_dim)
         global_cond: (B,global_cond_dim)
+        cross_attention_cond: (B, cross_attention_dim) - 用于 Cross Attention 的条件
         output: (B,T,input_dim)
         """
         sample = einops.rearrange(sample, 'b h t -> b t h')
@@ -225,6 +247,12 @@ class ConditionalUnet1D(nn.Module):
         for mid_module in self.mid_modules:
             x = mid_module(x, global_feature)
         mid_feature = x  # 保存中间特征，shape: (B, mid_dim, horizon)
+        
+        # ===== 新增：Cross Attention =====
+        if self.use_cross_attention and self.mid_cross_attention is not None:
+            if cross_attention_cond is not None:
+                x = self.mid_cross_attention(x, cross_attention_cond)
+        # ==================================
 
         for idx, (resnet, resnet2, upsample) in enumerate(self.up_modules):
             x = torch.cat((x, h.pop()), dim=1)

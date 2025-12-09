@@ -34,6 +34,12 @@ policy:
     kernel_size: 5
     n_groups: 8
     cond_predict_scale: True
+    # ===== Cross Attention 配置 =====
+    use_cross_attention: ${policy.use_cross_attention}
+    cross_attention_dim: ${action_dim}  # displacement_gt 维度与 action_dim 相同
+    cross_attention_heads: 4
+    cross_attention_head_dim: 64
+    # =================================
   
   noise_scheduler:
     _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
@@ -59,12 +65,15 @@ policy:
   # scheduler.step params
   # predict_epsilon: True
 
-  # ===== 新增配置 =====
-  use_alignment_loss: true
-  alignment_loss_weight: 0.5     # 可调节权重
-  alignment_loss_type: 'mse'     # 或 'cosine'
+  # ===== REPA 对齐损失配置（已禁用）=====
+  use_alignment_loss: false       # 禁用 REPA 投影 loss
+  alignment_loss_weight: 0.5     
+  alignment_loss_type: 'mse'     
   projection_hidden_dims: [512, 256]
-  # ====================
+  
+  # ===== Cross Attention 配置（启用）=====
+  use_cross_attention: true       # 使用 cross attention 注入 displacement
+  # ======================================
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel

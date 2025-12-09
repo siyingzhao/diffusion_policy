@@ -24,12 +24,14 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             obs_as_global_cond=False,
             pred_action_steps_only=False,
             oa_step_convention=False,
-            # ===== 新增参数 =====
+            # ===== REPA 对齐 loss 参数 =====
             use_alignment_loss=False,           # 是否启用对齐 loss
             alignment_loss_weight=0.5,          # 对齐 loss 权重
-            projection_hidden_dims=[512, 256],        # MLP 隐藏层维度
+            projection_hidden_dims=[512, 256],  # MLP 隐藏层维度
             alignment_loss_type='mse',          # 'mse' 或 'cosine'
-            # ====================
+            # ===== Cross Attention 参数 =====
+            use_cross_attention=False,          # 是否使用 Cross Attention 注入 displacement
+            # ================================
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -76,6 +78,10 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
                 output_dim=action_dim,  # displacement 与 action 维度相同
                 hidden_dims=projection_hidden_dims
             )
+        
+        # ===== 新增：Cross Attention 标志 =====
+        self.use_cross_attention = use_cross_attention
+        # ======================================
     
     # ========= inference  ============
     def conditional_sample(self, 
@@ -102,9 +108,11 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             trajectory[condition_mask] = condition_data[condition_mask]
 
             # 2. predict model output
-             # ===== 修改这里：只取第一个返回值 =====
+            # 推理时不使用 cross attention (传递 None)
+            # cross attention 仅在训练时用于注入 displacement GT 信息
             model_output, _ = model(trajectory, t, 
-                local_cond=local_cond, global_cond=global_cond)
+                local_cond=local_cond, global_cond=global_cond,
+                cross_attention_cond=None)
 
             # 3. compute previous image: x_t -> x_t-1
             trajectory = scheduler.step(
@@ -273,9 +281,17 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         # apply conditioning
         noisy_trajectory[condition_mask] = trajectory[condition_mask]
         
-        # Predict the noise residual
+        # ===== 计算 displacement_gt（用于 Cross Attention 或 REPA） =====
+        displacement_gt = None
+        if self.use_cross_attention or self.use_alignment_loss:
+            displacement_gt = self._compute_displacement_gt(action)
+        
+        # ===== Predict the noise residual =====
+        # 如果使用 Cross Attention，传入 displacement_gt
+        cross_attention_cond = displacement_gt if self.use_cross_attention else None
         pred, mid_feature = self.model(noisy_trajectory, timesteps, 
-            local_cond=local_cond, global_cond=global_cond)
+            local_cond=local_cond, global_cond=global_cond,
+            cross_attention_cond=cross_attention_cond)
 
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':
@@ -295,15 +311,13 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         total_loss = diffusion_loss
     
         if self.use_alignment_loss and self.projection_head is not None:
-            # 1. 计算 displacement GT
-            # action shape: (B, T, Da)
-            displacement_gt = self._compute_displacement_gt(action)
+            # displacement_gt 已在前面计算，此时一定不为 None
+            assert displacement_gt is not None, "displacement_gt should be computed when use_alignment_loss is True"
+            
+            # MLP 投影（梯度会回传到 UNet，alignment_loss 影响 UNet 训练）
+            projected_displacement = self.projection_head(mid_feature)
         
-            # 2. MLP 投影（使用 detach() 阻断梯度回传到 UNet）
-            # 这样 alignment_loss 只更新 projection_head，不影响 UNet
-            projected_displacement = self.projection_head(mid_feature.detach())
-        
-            # 3. 计算对齐 loss (REPA-style: 归一化 + 负余弦相似度)
+            # 计算对齐 loss (REPA-style: 归一化 + 负余弦相似度)
             if self.alignment_loss_type == 'mse':
                 alignment_loss = F.mse_loss(
                     projected_displacement, 
