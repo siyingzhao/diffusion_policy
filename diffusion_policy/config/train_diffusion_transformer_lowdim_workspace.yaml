@@ -18,6 +18,7 @@ past_action_visible: False
 keypoint_visible_rate: 1.0
 obs_as_cond: True
 pred_action_steps_only: False
+use_displacement_token: True  # 新增：是否使用位移token
 
 policy:
   _target_: diffusion_policy.policy.diffusion_transformer_lowdim_policy.DiffusionTransformerLowdimPolicy
@@ -26,7 +27,8 @@ policy:
     _target_: diffusion_policy.model.diffusion.transformer_for_diffusion.TransformerForDiffusion
     input_dim: ${eval:'${action_dim} if ${obs_as_cond} else ${obs_dim} + ${action_dim}'}
     output_dim: ${policy.model.input_dim}
-    horizon: ${horizon}
+    # 如果使用位移token，模型的horizon需要+1
+    horizon: ${eval:'${horizon} + 1 if ${use_displacement_token} else ${horizon}'}
     n_obs_steps: ${n_obs_steps}
     cond_dim: ${eval:'${obs_dim} if ${obs_as_cond} else 0'}
 
@@ -59,6 +61,7 @@ policy:
   num_inference_steps: 100
   obs_as_cond: ${obs_as_cond}
   pred_action_steps_only: ${pred_action_steps_only}
+  use_displacement_token: ${use_displacement_token}  # 新增
 
   # scheduler.step params
   # predict_epsilon: True
