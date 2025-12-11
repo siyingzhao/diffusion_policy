@@ -75,6 +75,7 @@ policy:
   use_cross_attention: true                    # 使用 cross attention 注入 displacement
   displacement_predictor_hidden_dims: [256, 128]  # Displacement Predictor MLP 隐藏层
   displacement_loss_weight: 1.0                # Displacement 预测 loss 权重
+  use_gt_in_train: false                       # false=方案B(训推一致), true=方案A(训练用GT)
   # ======================================
 
 ema:

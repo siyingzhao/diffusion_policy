@@ -67,6 +67,7 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             use_cross_attention=False,          # 是否使用 Cross Attention 注入 displacement
             displacement_predictor_hidden_dims=[256, 128],  # Displacement Predictor MLP 隐藏层
             displacement_loss_weight=1.0,       # Displacement 预测 loss 权重
+            use_gt_in_train=True,               # True=方案A(训练用GT), False=方案B(训练也用MLP预测)
             # ================================
             # parameters passed to step
             **kwargs):
@@ -118,6 +119,7 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         # ===== 新增：Cross Attention 和 Displacement Predictor =====
         self.use_cross_attention = use_cross_attention
         self.displacement_loss_weight = displacement_loss_weight
+        self.use_gt_in_train = use_gt_in_train  # 方案 A/B 切换
         
         # 初始化 Displacement Predictor MLP
         self.displacement_predictor = None
@@ -357,8 +359,16 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             displacement_loss = F.mse_loss(displacement_pred, displacement_gt)
         
         # ===== Predict the noise residual =====
-        # 训练时使用 displacement_gt 注入 Cross Attention（方案 A）
-        cross_attention_cond = displacement_gt if self.use_cross_attention else None
+        # 根据 use_gt_in_train 选择方案 A 或 B
+        # 方案 A (use_gt_in_train=True): 训练时用 GT，推理时用 MLP 预测
+        # 方案 B (use_gt_in_train=False): 训练和推理都用 MLP 预测（训推一致）
+        cross_attention_cond = None
+        if self.use_cross_attention:
+            if self.use_gt_in_train:
+                cross_attention_cond = displacement_gt  # 方案 A: 用 GT
+            else:
+                cross_attention_cond = displacement_pred  # 方案 B: 用 MLP 预测
+        
         pred, mid_feature = self.model(noisy_trajectory, timesteps, 
             local_cond=local_cond, global_cond=global_cond,
             cross_attention_cond=cross_attention_cond)
