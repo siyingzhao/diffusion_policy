@@ -10,6 +10,40 @@ from diffusion_policy.policy.base_lowdim_policy import BaseLowdimPolicy
 from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
 from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
 
+
+class DisplacementPredictor(nn.Module):
+    """
+    从观测序列预测轨迹的位移向量
+    obs: (B, n_obs_steps, obs_dim) -> displacement: (B, action_dim)
+    """
+    def __init__(self, obs_dim, n_obs_steps, output_dim, hidden_dims=[256, 128]):
+        super().__init__()
+        input_dim = obs_dim * n_obs_steps  # 展平观测
+        
+        layers = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(prev_dim, hidden_dim),
+                nn.ReLU(),
+            ])
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, output_dim))
+        
+        self.mlp = nn.Sequential(*layers)
+    
+    def forward(self, obs):
+        """
+        Args:
+            obs: (B, n_obs_steps, obs_dim) - 归一化后的观测序列
+        Returns:
+            displacement: (B, output_dim) - 预测的位移向量
+        """
+        B = obs.shape[0]
+        obs_flat = obs.reshape(B, -1)  # (B, n_obs_steps * obs_dim)
+        return self.mlp(obs_flat)
+
+
 class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
     def __init__(self, 
             model: ConditionalUnet1D,
@@ -31,6 +65,8 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             alignment_loss_type='mse',          # 'mse' 或 'cosine'
             # ===== Cross Attention 参数 =====
             use_cross_attention=False,          # 是否使用 Cross Attention 注入 displacement
+            displacement_predictor_hidden_dims=[256, 128],  # Displacement Predictor MLP 隐藏层
+            displacement_loss_weight=1.0,       # Displacement 预测 loss 权重
             # ================================
             # parameters passed to step
             **kwargs):
@@ -79,14 +115,26 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
                 hidden_dims=projection_hidden_dims
             )
         
-        # ===== 新增：Cross Attention 标志 =====
+        # ===== 新增：Cross Attention 和 Displacement Predictor =====
         self.use_cross_attention = use_cross_attention
-        # ======================================
+        self.displacement_loss_weight = displacement_loss_weight
+        
+        # 初始化 Displacement Predictor MLP
+        self.displacement_predictor = None
+        if use_cross_attention:
+            self.displacement_predictor = DisplacementPredictor(
+                obs_dim=obs_dim,
+                n_obs_steps=n_obs_steps,
+                output_dim=action_dim,  # displacement 维度与 action 相同
+                hidden_dims=displacement_predictor_hidden_dims
+            )
+        # ================================================================
     
     # ========= inference  ============
     def conditional_sample(self, 
             condition_data, condition_mask,
             local_cond=None, global_cond=None,
+            nobs=None,  # 新增：用于预测 displacement 的观测
             generator=None,
             # keyword arguments to scheduler.step
             **kwargs
@@ -102,17 +150,23 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
     
         # set step values
         scheduler.set_timesteps(self.num_inference_steps)
+        
+        # ===== 推理时：使用 Displacement Predictor 预测 displacement =====
+        cross_attention_cond = None
+        if self.use_cross_attention and self.displacement_predictor is not None and nobs is not None:
+            # nobs: (B, n_obs_steps, obs_dim)
+            cross_attention_cond = self.displacement_predictor(nobs)
+        # =================================================================
 
         for t in scheduler.timesteps:
             # 1. apply conditioning
             trajectory[condition_mask] = condition_data[condition_mask]
 
             # 2. predict model output
-            # 推理时不使用 cross attention (传递 None)
-            # cross attention 仅在训练时用于注入 displacement GT 信息
+            # 推理时使用 Displacement Predictor 的输出
             model_output, _ = model(trajectory, t, 
                 local_cond=local_cond, global_cond=global_cond,
-                cross_attention_cond=None)
+                cross_attention_cond=cross_attention_cond)
 
             # 3. compute previous image: x_t -> x_t-1
             trajectory = scheduler.step(
@@ -191,11 +245,14 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             cond_mask[:,:To,Da:] = True
 
         # run sampling
+        # 传递 nobs[:,:To] 给 Displacement Predictor
+        nobs_for_predictor = nobs[:,:To]  # (B, n_obs_steps, obs_dim)
         nsample = self.conditional_sample(
             cond_data, 
             cond_mask,
             local_cond=local_cond,
             global_cond=global_cond,
+            nobs=nobs_for_predictor,
             **self.kwargs)
         
         # unnormalize prediction
@@ -283,11 +340,24 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         
         # ===== 计算 displacement_gt（用于 Cross Attention 或 REPA） =====
         displacement_gt = None
+        displacement_pred = None
+        displacement_loss = torch.tensor(0.0, device=trajectory.device)
+        
         if self.use_cross_attention or self.use_alignment_loss:
             displacement_gt = self._compute_displacement_gt(action)
         
+        # ===== 使用 Displacement Predictor 预测并计算 loss =====
+        if self.use_cross_attention and self.displacement_predictor is not None:
+            assert displacement_gt is not None, "displacement_gt should be computed when use_cross_attention is True"
+            # 获取用于预测的 obs: (B, n_obs_steps, obs_dim)
+            obs_for_predictor = obs[:, :self.n_obs_steps, :]
+            displacement_pred = self.displacement_predictor(obs_for_predictor)
+            
+            # 计算 Displacement Predictor 的监督 loss
+            displacement_loss = F.mse_loss(displacement_pred, displacement_gt)
+        
         # ===== Predict the noise residual =====
-        # 如果使用 Cross Attention，传入 displacement_gt
+        # 训练时使用 displacement_gt 注入 Cross Attention（方案 A）
         cross_attention_cond = displacement_gt if self.use_cross_attention else None
         pred, mid_feature = self.model(noisy_trajectory, timesteps, 
             local_cond=local_cond, global_cond=global_cond,
@@ -307,8 +377,12 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         diffusion_loss = reduce(diffusion_loss, 'b ... -> b (...)', 'mean')
         diffusion_loss = diffusion_loss.mean()
 
-        # ===== 新增：计算对齐 loss =====
+        # ===== 计算总 loss =====
         total_loss = diffusion_loss
+        
+        # 添加 Displacement Predictor loss
+        if self.use_cross_attention and self.displacement_predictor is not None:
+            total_loss = total_loss + self.displacement_loss_weight * displacement_loss
     
         if self.use_alignment_loss and self.projection_head is not None:
             # displacement_gt 已在前面计算，此时一定不为 None
@@ -345,7 +419,8 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
                 'total_loss': total_loss,
                 'diffusion_loss': diffusion_loss.detach(),
                 'alignment_loss': alignment_loss.detach(),
-                'alignment_relative_error': alignment_relative_error.detach()
+                'alignment_relative_error': alignment_relative_error.detach(),
+                'displacement_loss': displacement_loss.detach() if isinstance(displacement_loss, torch.Tensor) else displacement_loss
             }
         # ===============================
     
@@ -354,5 +429,6 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             'total_loss': total_loss,
             'diffusion_loss': diffusion_loss.detach(),
             'alignment_loss': torch.tensor(0.0, device=diffusion_loss.device),
-            'alignment_relative_error': torch.tensor(0.0, device=diffusion_loss.device)
+            'alignment_relative_error': torch.tensor(0.0, device=diffusion_loss.device),
+            'displacement_loss': displacement_loss.detach() if isinstance(displacement_loss, torch.Tensor) else displacement_loss
         }

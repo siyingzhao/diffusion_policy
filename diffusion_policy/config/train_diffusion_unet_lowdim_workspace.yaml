@@ -72,7 +72,9 @@ policy:
   projection_hidden_dims: [512, 256]
   
   # ===== Cross Attention 配置（启用）=====
-  use_cross_attention: true       # 使用 cross attention 注入 displacement
+  use_cross_attention: true                    # 使用 cross attention 注入 displacement
+  displacement_predictor_hidden_dims: [256, 128]  # Displacement Predictor MLP 隐藏层
+  displacement_loss_weight: 1.0                # Displacement 预测 loss 权重
   # ======================================
 
 ema:
