@@ -165,7 +165,8 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                             train_sampling_batch = batch
 
                         # compute loss
-                        raw_loss = self.model.compute_loss(batch)
+                        loss_dict = self.model.compute_loss(batch)
+                        raw_loss = loss_dict['loss']
                         loss = raw_loss / cfg.training.gradient_accumulate_every
                         loss.backward()
 
@@ -189,6 +190,11 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                             'epoch': self.epoch,
                             'lr': lr_scheduler.get_last_lr()[0]
                         }
+                        # 添加各 loss 组件到日志
+                        if 'diffusion_loss' in loss_dict:
+                            step_log['diffusion_loss'] = loss_dict['diffusion_loss'].item()
+                        if 'alignment_loss' in loss_dict:
+                            step_log['alignment_loss'] = loss_dict['alignment_loss'].item()
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:
@@ -226,8 +232,8 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = self.model.compute_loss(batch)
-                                val_losses.append(loss)
+                                loss_dict = self.model.compute_loss(batch)
+                                val_losses.append(loss_dict['loss'])
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
                                     break

@@ -319,6 +319,15 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         
             # 4. 加权组合
             total_loss = diffusion_loss + self.alignment_loss_weight * alignment_loss
+            
+            return {
+                'loss': total_loss,
+                'diffusion_loss': diffusion_loss,
+                'alignment_loss': alignment_loss
+            }
         # ===============================
     
-        return total_loss
+        return {
+            'loss': total_loss,
+            'diffusion_loss': diffusion_loss
+        }
